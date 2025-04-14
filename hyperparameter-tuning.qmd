@@ -1,0 +1,193 @@
+---
+project:
+  type: website
+  output-dir: docs
+title: "Lab 8 Machine Learning hyperparameter-tuning"
+author: Jessie Magalit
+format:
+  html:
+    self-contained: true
+---
+
+# Introduction
+
+In this lab, we will apply the concepts we learned in Unit 3 on Machine Learning, such as feature engineering, resampling, model evaluation, and hyperparameter tuning, to a regression problem. Specifically, we will predict the `q_mean` variable using the CAMELS dataset and create a complete machine learning pipeline.
+
+# Lab Setup
+
+1. Open your existing lab 6 project.
+2. Create a new Quarto document called `hyperparameter-tuning.qmd` in the project folder.
+
+# Libraries
+
+We will use the `tidyverse` and `tidymodels` packages for data manipulation, modeling, and evaluation.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(skimr)
+library(visdat)
+library(ggpubr)
+library(rsample)
+library(recipes)
+library(parsnip)
+library(randomForest)
+library(xgboost)
+
+```
+
+## Data Import/Tidy/Transformation
+```{r}
+# Defining file types and URLs
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+root <- 'https://gdex.ucar.edu/dataset/camels/file'
+remote_files <- glue('{root}/camels_{types}.txt')
+local_files <- glue('data/camels_{types}.txt')
+
+# Download and read the files into a list
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+camels <- map(local_files, read_delim, show_col_types = FALSE)
+
+# Join the datasets by 'gauge_id'
+camels_data <- reduce(camels, power_full_join, by = "gauge_id")
+
+# EDA - Explore data structure
+skim(camels_data)
+
+# Visual inspection for missing data
+vis_miss(camels_data)
+
+# Some basic plotting to understand the distribution
+ggboxplot(camels_data, x = "p_mean", y = "q_mean") 
+
+# Remove columns that are irrelevant for modeling, but keep latitude/longitude
+camels_data_clean <- camels_data %>%
+  select(-c(geol_1st_class, glim_1st_class_frac)) %>%  # Example: Drop unwanted columns, keep only relevant ones
+  drop_na()  # Remove rows with missing values
+
+# Check again after cleaning
+skim(camels_data_clean)
+
+```
+
+## Data Splitting
+```{r}
+# Set the seed for reproducibility
+set.seed(123)
+
+# Split the data into training and testing sets (80% for training, 20% for testing)
+split_data <- initial_split(camels_data_clean, prop = 0.8)
+
+# Extract training and testing sets
+train_data <- training(split_data)
+test_data <- testing(split_data)
+
+# Check the dimensions of the datasets
+dim(train_data)
+dim(test_data)
+
+```
+
+## Feature Engineering
+```{r}
+# Create a recipe to predict 'q_mean'
+camels_recipe <- recipe(q_mean ~ ., data = train_data) %>%
+  step_rm(gauge_lat, gauge_lon) %>%  # Remove 'gauge_lat' and 'gauge_lon'
+  step_corr(all_numeric(), threshold = 0.9) %>%  # Remove highly correlated features
+  step_normalize(all_numeric()) %>%  # Normalize numeric variables
+  step_novel(all_nominal(), -all_outcomes()) %>%  # Handle new factor levels
+  step_dummy(all_nominal(), -all_outcomes())  # Convert categorical variables to dummy variables
+
+```
+
+## Resampling and Model Testing
+## 1 Build Resamples
+```{r}
+# Create 10-fold cross-validation resamples
+cv_splits <- vfold_cv(train_data, v = 10)
+
+# View the resamples
+cv_splits
+
+```
+## 2 Build 3 Candidate Models
+```{r}
+# Define hyperparameter grid for random forest
+rf_grid <- grid_regular(
+  trees(range = c(100, 1000)),
+  mtry(range = c(2, 10)),
+  levels = 5
+)
+
+# Define hyperparameter grid for boosted trees
+boosted_tree_grid <- grid_regular(
+  trees(range = c(100, 1000)),
+  tree_depth(range = c(3, 10)),
+  min_n(range = c(2, 10)),
+  levels = 5
+)
+
+# Model 1: Linear Regression Model
+lm_model <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+# Model 2: Random Forest with tuning
+rf_model <- rand_forest(
+  mtry = tune(), 
+  trees = tune()
+) %>%
+  set_engine("randomForest") %>%
+  set_mode("regression")
+
+# Model 3: Boosted Trees with tuning
+boosted_tree_model <- boost_tree(
+  trees = tune(), 
+  tree_depth = tune(), 
+  min_n = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+```
+
+## 3 Test the Models
+```{r}
+# Combine the recipe with all three models into a workflow set
+workflow_list <- workflow_set(
+  preproc = list(recipe = camels_recipe),
+  models = list(
+    linear_reg = lm_model,
+    rand_forest = rf_model,
+    boost_tree = boosted_tree_model
+  )
+)
+
+# Test the models using 10-fold CV
+set.seed(123)
+workflow_results <- workflow_map(
+  workflow_list,
+  resamples = cv_splits,
+  grid = 5,  # Number of tuning combinations for each model
+  metrics = metric_set(rmse, rsq),
+  verbose = TRUE
+)
+
+# Visualize performance of each model
+autoplot(workflow_results)
+
+```
+
+## 4 Model Selection
+```{r}
+
+```
+
+## Model Tuning
+## 1 Build a Model for your chosen Specification
+```{r}
+
+```
+
