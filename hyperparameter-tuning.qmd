@@ -1,0 +1,268 @@
+---
+project:
+  type: website
+  output-dir: docs
+title: "Lab 8 Machine Learning hyperparameter-tuning"
+author: Jessie Magalit
+format:
+  html:
+    self-contained: true
+---
+
+# Introduction
+
+In this lab, we will apply the concepts we learned in Unit 3 on Machine Learning, such as feature engineering, resampling, model evaluation, and hyperparameter tuning, to a regression problem. Specifically, we will predict the `q_mean` variable using the CAMELS dataset and create a complete machine learning pipeline.
+
+# Lab Setup
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(skimr)
+library(visdat)
+library(ggpubr)
+library(patchwork)
+library(dials)
+library(glue)
+
+```
+
+```{r}
+root  <- 'https://gdex.ucar.edu/dataset/camels/file'
+
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+remote_files  <- glue('{root}/camels_{types}.txt')
+local_files   <- glue('data/camels_{types}.txt')
+
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+
+camels <- map(local_files, read_delim, show_col_types = FALSE) |> 
+  power_full_join(by = 'gauge_id')
+```
+
+# Data Cleaning and EDA
+```{r}
+camels_clean <- camels |> 
+  janitor::clean_names() |> 
+  drop_na() 
+
+skimr::skim(camels_clean)
+visdat::vis_dat(camels_clean)
+
+```
+
+# Split the Data
+```{r}
+set.seed(330)
+
+camels_split <- initial_split(camels_clean, prop = 0.8)
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+
+```
+
+# Feature Engineering with Recipes
+```{r}
+camels_recipe <- recipe(q_mean ~ ., data = camels_train) |> 
+  step_rm(gauge_lat, gauge_lon) |> 
+  step_normalize(all_numeric_predictors())
+
+```
+
+# 1 Build Resamples
+```{r}
+set.seed(330)
+folds <- vfold_cv(camels_train, v = 10)
+
+```
+
+# 2 Build 3 Candidate Models
+```{r}
+# Linear regression model
+lm_model <- linear_reg() |> 
+  set_engine("lm") |> 
+  set_mode("regression")
+
+# Decision tree model
+tree_model <- decision_tree() |> 
+  set_engine("rpart") |> 
+  set_mode("regression")
+
+# Random forest model
+rf_model <- rand_forest() |> 
+  set_engine("ranger") |> 
+  set_mode("regression")
+
+
+```
+
+# 3 Test the models
+```{r}
+model_set <- workflow_set(
+  preproc = list(camels_recipe),
+  models = list(
+    linear = lm_model,
+    tree   = tree_model,
+    forest = rf_model
+  )
+)
+
+model_results <- model_set |> 
+  workflow_map("fit_resamples", resamples = folds)
+
+autoplot(model_results)
+
+
+```
+# 4 Model Selection
+My chosen model is the random forest model because it had the lowest RMSE and MAE, and the highest R² out of the three. It seems to handle the data best and probably does well because it can pick up on complex patterns that simpler models like linear regression miss.
+
+# Model Tuning
+# 1 Build a model for your chosen specification
+```{r}
+# Define the random forest model with the 'trees' parameter tuned
+rf_tune_model <- rand_forest(
+  mtry = tune(),  # Tunable mtry parameter
+  min_n = tune(), # Tunable min_n parameter
+  trees = tune()  # Tunable trees parameter (added)
+) |> 
+  set_engine("ranger") |> 
+  set_mode("regression")
+
+```
+
+# 2 Create a Workflow
+```{r}
+wf_tune <- workflow() |> 
+  add_model(rf_tune_model) |> 
+  add_recipe(camels_recipe)
+
+```
+
+# 3 Check The Tunable Values / Ranges
+```{r}
+# Define the hyperparameters to tune, including 'trees'
+dials <- parameters(
+  mtry(range = c(2, 15)),    # Number of variables to consider at each split
+  min_n(range = c(2, 10)),   # Minimum number of data points in each node
+  trees(range = c(50, 200))  # Number of trees to use in the forest
+)
+
+# Finalize the dials object
+dials <- finalize(dials)
+
+```
+
+# 4 Define the Search Space
+```{r}
+# Assuming you are working with these hyperparameters
+dials <- parameters(
+  mtry(range = c(2, 15)),
+  min_n(range = c(2, 10)),
+  trees(range = c(50, 200))
+)
+
+# Now finalize the dials object
+dials <- finalize(dials)
+
+# Perform the grid search
+set.seed(330)
+my.grid <- grid_latin_hypercube(dials, size = 25)
+
+```
+
+# 5 Tune the Model
+```{r}
+# Create the Latin Hypercube grid
+set.seed(330)
+my.grid <- grid_latin_hypercube(dials, size = 25)
+
+# Perform the grid search to tune the model
+model_params <- tune_grid(
+    wf_tune,
+    resamples = folds,
+    grid = my.grid,
+    metrics = metric_set(rmse, rsq, mae),
+    control = control_grid(save_pred = TRUE)
+)
+
+# Visualize the tuning results
+autoplot(model_params)
+
+```
+
+# 6 Check the skill of the tuned model
+```{r}
+collect_metrics(model_params) |> 
+  arrange(mean)
+
+show_best(model_params, metric = "mae")
+
+hp_best <- select_best(model_params, metric = "mae")
+
+```
+
+# 7 Finalize your model
+```{r}
+wf_final <- finalize_workflow(
+  wf_tune,
+  hp_best
+)
+
+```
+
+# Final Model Verification
+```{r}
+final_wf <- finalize_workflow(wf_tune, hp_best)
+
+final_fit <- last_fit(final_wf, split = camels_split)
+
+final_predictions <- collect_predictions(final_fit)
+
+ggplot(final_predictions, aes(x = .pred, y = q_mean)) +
+  geom_point(color = "steelblue", alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkorange", linetype = "dashed") +
+  geom_abline(intercept = 0, slope = 1, color = "darkgreen", linetype = "dotted") +
+  labs(
+    x = "Predicted q_mean",
+    y = "Actual q_mean",
+    title = "Predicted vs Actual q_mean",
+    subtitle = "Final Random Forest Model Performance",
+    caption = "Dashed = model fit | Dotted = perfect prediction"
+  ) +
+  theme_minimal()
+
+```
+
+# Building a Map!
+```{r}
+ # Fit finalized workflow to full cleaned dataset
+final_model_fit <- fit(final_wf, camels_clean)
+
+# Use augment() to add predictions to the original data
+camels_pred <- augment(final_model_fit, new_data = camels_clean)
+
+# Residual = (truth - prediction)^2
+camels_pred <- camels_pred |>
+  mutate(residual = (q_mean - .pred)^2)
+
+# Map of predicted q_mean
+map_pred <- ggplot(camels_pred, aes(x = gauge_lon, y = gauge_lat)) +
+  geom_point(aes(color = .pred), size = 3) +
+  scale_color_viridis_c(option = "C", name = "Predicted q_mean") +
+  labs(title = "Predicted Streamflow (q_mean)") +
+  theme_minimal()
+
+# Map of residuals
+map_resid <- ggplot(camels_pred, aes(x = gauge_lon, y = gauge_lat)) +
+  geom_point(aes(color = residual), size = 3) +
+  scale_color_viridis_c(option = "A", name = "Residual (squared)") +
+  labs(title = "Prediction Residuals") +
+  theme_minimal()
+
+library(patchwork)
+
+map_pred + map_resid
+
+```
